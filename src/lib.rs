@@ -15,10 +15,12 @@ mod state;
 pub use config::AppConfig;
 
 pub async fn run(config: AppConfig) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>> {
+    let port = config.port;
+
     let state = AppState::init(config)?;
     let app = api_routes(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     info!("Listening on {}", addr);
 
     let app = async move {
