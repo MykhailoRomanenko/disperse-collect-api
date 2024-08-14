@@ -1,7 +1,9 @@
-use log::info;
+use axum::Router;
 use routes::api_routes;
 use state::AppState;
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
+use tracing::info;
 
 use std::{future::Future, net::SocketAddr};
 
@@ -18,13 +20,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<impl Future<Output = anyho
     let port = config.port;
 
     let state = AppState::init(config)?;
-    let app = api_routes(state);
+    let app = Router::new()
+        .nest("/api", api_routes(state))
+        .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     info!("Listening on {}", addr);
 
     let app = async move {
-        axum::serve(TcpListener::bind(addr).await?, app)
+        axum::serve(TcpListener::bind(addr).await?, app.into_make_service())
             .await
             .map_err(Into::into)
     };

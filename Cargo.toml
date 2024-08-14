@@ -12,10 +12,11 @@ axum = "0.7.5"
 config = "0.14.0"
 derive-getters = "0.5.0"
 dotenvy = "0.15.7"
-env_logger = "0.11.5"
 futures = "0.3.30"
-log = "0.4.22"
 serde = { version = "1.0.206", features = ["derive"] }
 thiserror = "1.0.63"
 tokio = { version = "1.39.2", features = ["full"] }
+tower-http = { version = "0.5.2", features = ["trace"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = { version = "2.5.2", features = ["serde"] }
