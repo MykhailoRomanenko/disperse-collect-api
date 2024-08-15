@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use alloy::{
     contract,
+    network::TransactionBuilder,
     primitives::{Address, U256},
     providers::{Provider, WalletProvider},
+    rpc::types::TransactionRequest,
+    serde::WithOtherFields,
     transports::{RpcError, TransportErrorKind},
 };
 use futures::future::try_join_all;
@@ -11,13 +14,14 @@ use thiserror::Error;
 use tokio::try_join;
 
 use alloy::contract::Error as ContractError;
+use tracing::instrument;
 
 use crate::{
     contracts::{DisperseCollectContract, Erc20Contract},
     dto::{
-        CollectErc20Request, CollectErc20Response, DisperseCollectResponse, DisperseErc20Request,
-        DisperseErc20Response, DisperseEthRequest, DisperseEthResponse, FractionOrAmount,
-        FractionalAmount,
+        ApproveRequest, CollectErc20Request, CollectErc20Response, DisperseCollectResponse,
+        DisperseErc20Request, DisperseErc20Response, DisperseEthRequest, DisperseEthResponse,
+        FractionOrAmount, FractionalAmount, TransactionResponse, TransferRequest,
     },
     state::DefaultProvider,
 };
@@ -32,15 +36,21 @@ pub enum DcError {
         available: U256,
         address: Address,
     },
-    #[error("fraction {0} results in invalid amount")]
-    InvalidFractionalAmount(FractionalAmount),
+    #[error(transparent)]
+    InvalidFractionalAmount(#[from] InvalidFractionalAmountError),
     #[error("erc20 not found at address: {0}")]
     TokenNotFound(Address),
     #[error("error communicating with node: {0}")]
     Transport(#[from] TransportErrorKind),
     #[error("unexpected error: {0}")]
     Unexpected(#[source] anyhow::Error),
+    #[error("no signer found for {0}")]
+    SignerNotFound(Address),
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("fraction {0} results in invalid or zero amount for corresponding balance")]
+pub struct InvalidFractionalAmountError(FractionalAmount);
 
 impl DcError {
     pub fn unexpected(e: impl Into<anyhow::Error>) -> Self {
@@ -72,24 +82,24 @@ pub async fn disperse_eth(
     contract: &DisperseCollectContract,
     request: DisperseEthRequest,
 ) -> Result<DisperseEthResponse, DcError> {
-    let available_balance = provider
-        .get_balance(provider.signer_addresses().next().unwrap())
-        .await?;
+    let available_balance = provider.get_balance(request.caller).await?;
 
-    let (addresses, amounts) =
-        get_disperse_args(available_balance, request.recipients.into_iter())?;
+    let (addresses, amounts) = construct_disperse_recipients(
+        request.caller,
+        available_balance,
+        request.recipients.into_iter(),
+    )?;
 
     let tx = contract
         .disperseEth(addresses.clone(), amounts.clone())
-        .send()
-        .await
-        .map_err(DcError::unexpected)?
-        .get_receipt()
-        .await?;
+        .value(amounts.iter().sum())
+        .into_transaction_request();
+
+    let tx_response = send_transaction(provider, tx, request.caller).await?;
 
     Ok(DisperseEthResponse(DisperseCollectResponse {
-        tx_hash: tx.transaction_hash,
         transfers: BTreeMap::from_iter(addresses.into_iter().zip(amounts)),
+        tx: tx_response,
     }))
 }
 
@@ -114,13 +124,11 @@ pub async fn disperse_erc20(
 
     let available_balance = balance.min(allowance);
 
-    let (addresses, amounts) = get_disperse_args(available_balance, request.recipients.into_iter())
-        .map_err(|mut e| {
-            if let DcError::InsufficientFunds { address, .. } = &mut e {
-                *address = request.spender;
-            }
-            e
-        })?;
+    let (addresses, amounts) = construct_disperse_recipients(
+        request.spender,
+        available_balance,
+        request.recipients.into_iter(),
+    )?;
 
     let tx = contract
         .disperseERC20(
@@ -129,18 +137,17 @@ pub async fn disperse_erc20(
             addresses.clone(),
             amounts.clone(),
         )
-        .send()
-        .await
-        .map_err(DcError::unexpected)?
-        .get_receipt()
-        .await?;
+        .into_transaction_request();
+
+    let tx_response = send_transaction(provider, tx, request.caller).await?;
 
     Ok(DisperseErc20Response(DisperseCollectResponse {
-        tx_hash: tx.transaction_hash,
+        tx: tx_response,
         transfers: BTreeMap::from_iter(addresses.into_iter().zip(amounts)),
     }))
 }
 
+#[instrument(skip(provider, contract), target = "collect_erc20")]
 pub async fn collect_erc20(
     provider: &DefaultProvider,
     contract: &DisperseCollectContract,
@@ -167,12 +174,7 @@ pub async fn collect_erc20(
     let mut amounts = Vec::with_capacity(request.spenders.len());
 
     for ((allowance, balance), (address, amount)) in balances.zip(request.spenders.into_iter()) {
-        let actual_amount = match amount {
-            FractionOrAmount::Amount { amount } => amount,
-            FractionOrAmount::Fraction(f) => f
-                .to_absolute(balance)
-                .ok_or(DcError::InvalidFractionalAmount(f))?,
-        };
+        let actual_amount = normalize_amount(amount, balance)?;
 
         let available = allowance.min(balance);
 
@@ -195,19 +197,157 @@ pub async fn collect_erc20(
             addresses.clone(),
             amounts.clone(),
         )
-        .send()
-        .await
-        .map_err(DcError::unexpected)?
-        .get_receipt()
-        .await?;
+        .into_transaction_request();
+
+    let tx_response = send_transaction(provider, tx, request.caller).await?;
 
     Ok(CollectErc20Response(DisperseCollectResponse {
-        tx_hash: tx.transaction_hash,
+        tx: tx_response,
         transfers: BTreeMap::from_iter(addresses.into_iter().zip(amounts)),
     }))
 }
 
-fn get_disperse_args(
+pub async fn transfer(
+    provider: &DefaultProvider,
+    request: TransferRequest,
+) -> Result<TransactionResponse, DcError> {
+    match request.token {
+        Some(addr) => {
+            transfer_erc20(
+                provider,
+                request.caller,
+                request.recipient,
+                addr,
+                request.value,
+            )
+            .await
+        }
+        None => transfer_eth(provider, request.caller, request.recipient, request.value).await,
+    }
+}
+
+pub async fn transfer_eth(
+    provider: &DefaultProvider,
+    caller: Address,
+    recipient: Address,
+    amount: FractionOrAmount,
+) -> Result<TransactionResponse, DcError> {
+    let available_balance = provider.get_balance(caller).await?;
+
+    let actual_amount = normalize_amount(amount, available_balance)?;
+
+    if actual_amount > available_balance {
+        return Err(DcError::InsufficientFunds {
+            required: actual_amount,
+            available: available_balance,
+            address: caller,
+        });
+    }
+
+    let tx = TransactionRequest::default()
+        .value(actual_amount)
+        .to(recipient);
+
+    let tx_response = send_transaction(provider, WithOtherFields::new(tx), caller).await?;
+
+    Ok(tx_response)
+}
+
+pub async fn transfer_erc20(
+    provider: &DefaultProvider,
+    caller: Address,
+    recipient: Address,
+    token_address: Address,
+    amount: FractionOrAmount,
+) -> Result<TransactionResponse, DcError> {
+    let token = Erc20Contract::new(token_address, provider.clone());
+    let balance = get_erc20_balance(&token, caller).await?;
+
+    let actual_amount = normalize_amount(amount, balance)?;
+
+    if actual_amount > balance {
+        return Err(DcError::InsufficientFunds {
+            required: actual_amount,
+            available: balance,
+            address: caller,
+        });
+    }
+
+    let tx = token
+        .transfer(recipient, actual_amount)
+        .into_transaction_request();
+
+    let tx_response = send_transaction(provider, tx, caller).await?;
+
+    Ok(tx_response)
+}
+
+pub async fn approve(
+    provider: &DefaultProvider,
+    request: ApproveRequest,
+) -> Result<TransactionResponse, DcError> {
+    let token = Erc20Contract::new(request.token, provider.clone());
+
+    let balance = get_erc20_balance(&token, request.caller).await?;
+    let actual_amount = normalize_amount(request.amount, balance)?;
+
+    let tx = token
+        .approve(request.spender, actual_amount)
+        .into_transaction_request();
+
+    let tx_response = send_transaction(provider, tx, request.caller).await?;
+
+    Ok(tx_response)
+}
+
+async fn get_erc20_balance(token: &Erc20Contract, address: Address) -> Result<U256, DcError> {
+    token
+        .balanceOf(address)
+        .call()
+        .await
+        .map(|b| b._0)
+        .map_err(|e| DcError::from_erc20_err(e, *token.address()))
+}
+
+fn normalize_amount(
+    amount: FractionOrAmount,
+    available_balance: U256,
+) -> Result<U256, InvalidFractionalAmountError> {
+    let actual_amount = match amount {
+        FractionOrAmount::Amount { amount } => amount,
+        FractionOrAmount::Fraction(f) => f
+            .to_absolute(available_balance)
+            .filter(|a| *a != U256::ZERO)
+            .ok_or(InvalidFractionalAmountError(f))?,
+    };
+
+    Ok(actual_amount)
+}
+
+async fn send_transaction(
+    provider: &DefaultProvider,
+    mut tx: WithOtherFields<TransactionRequest>,
+    signer: Address,
+) -> Result<TransactionResponse, DcError> {
+    if !provider.has_signer_for(&signer) {
+        return Err(DcError::SignerNotFound(signer));
+    }
+
+    tx.set_from(signer);
+
+    let access_list = provider.create_access_list(&tx).await?.access_list;
+
+    tx.set_access_list(access_list);
+
+    let receipt = provider.send_transaction(tx).await?.get_receipt().await?;
+
+    Ok(TransactionResponse {
+        tx_hash: receipt.transaction_hash,
+    })
+}
+
+fn construct_disperse_recipients(
+    sender: Address,
     total_balance: U256,
     recipients: impl Iterator<Item = (Address, FractionOrAmount)>,
 ) -> Result<(Vec<Address>, Vec<U256>), DcError> {
@@ -219,12 +359,7 @@ fn get_disperse_args(
     let mut sum = U256::ZERO;
 
     for (address, amount) in recipients {
-        let actual_amount = match amount {
-            FractionOrAmount::Amount { amount } => amount,
-            FractionOrAmount::Fraction(f) => f
-                .to_absolute(total_balance)
-                .ok_or(DcError::InvalidFractionalAmount(f))?,
-        };
+        let actual_amount = normalize_amount(amount, total_balance)?;
         sum += actual_amount;
 
         addresses.push(address);
@@ -235,7 +370,7 @@ fn get_disperse_args(
         return Err(DcError::InsufficientFunds {
             required: sum,
             available: total_balance,
-            address: Default::default(),
+            address: sender,
         });
     }
 

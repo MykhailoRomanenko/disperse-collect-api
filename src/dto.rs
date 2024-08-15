@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Display};
+use std::{borrow::Cow, collections::BTreeMap, fmt::Display};
 
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
@@ -6,12 +6,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisperseCollectResponse {
-    pub tx_hash: B256,
+    #[serde(flatten)]
+    pub tx: TransactionResponse,
     pub transfers: BTreeMap<Address, U256>,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TransactionResponse {
+    pub tx_hash: B256,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "camelCase", untagged)]
 pub enum FractionOrAmount {
     Fraction(FractionalAmount),
     Amount { amount: U256 },
@@ -45,6 +52,7 @@ impl FractionalAmount {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectErc20Request {
+    pub caller: Address,
     pub recipient: Address,
     pub token: Address,
     pub spenders: BTreeMap<Address, FractionOrAmount>,
@@ -58,6 +66,7 @@ pub struct CollectErc20Response(pub DisperseCollectResponse);
 #[serde(rename_all = "camelCase")]
 pub struct DisperseEthRequest {
     pub recipients: BTreeMap<Address, FractionOrAmount>,
+    pub caller: Address,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,8 +79,47 @@ pub struct DisperseErc20Request {
     pub recipients: BTreeMap<Address, FractionOrAmount>,
     pub token: Address,
     pub spender: Address,
+    pub caller: Address,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisperseErc20Response(pub DisperseCollectResponse);
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferRequest {
+    pub recipient: Address,
+    pub value: FractionOrAmount,
+    pub token: Option<Address>,
+    pub caller: Address,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApproveRequest {
+    pub spender: Address,
+    pub amount: FractionOrAmount,
+    pub token: Address,
+    pub caller: Address,
+}
+
+#[derive(Serialize)]
+pub struct ErrorResponse<'a> {
+    pub error: Cow<'a, str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::U256;
+
+    use super::FractionalAmount;
+
+    #[test]
+    fn should_calculate_correct_amount() {
+        let f = FractionalAmount {
+            fraction: U256::from(110),
+            units: U256::from(1000),
+        };
+
+        assert_eq!(U256::from(11), f.to_absolute(U256::from(100)).unwrap());
+    }
+}
